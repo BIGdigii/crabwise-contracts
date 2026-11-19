@@ -129,21 +129,44 @@ pub fn window(total: u32, start: u32, limit: u32) -> (u32, u32) {
     (from, to)
 }
 
+/// The half-open index range `[start, end)` that a bounded read should visit
+/// for a zero-based `page` number and caller-supplied `limit`.
+///
+/// * `limit` goes through [`clamp_limit`], so `0` maps to [`DEFAULT_LIMIT`]
+///   and anything above [`MAX_LIMIT`] is clamped to [`MAX_LIMIT`].
+/// * `page * effective_limit` uses saturating multiplication, so `page = u32::MAX`
+///   never overflows and clamps cleanly to `(total, total)`.
+#[inline]
+pub fn page_window(total: u32, page: u32, limit: u32) -> (u32, u32) {
+    let effective_limit = clamp_limit(limit);
+    let start = page.saturating_mul(effective_limit);
+    window(total, start, effective_limit)
+}
+
 /// Build the [`PageInfo`] for a page spanning `[start, end)` of a list of
 /// `total` items, of which `count` were actually returned.
 ///
-/// `end` must already be clamped, as [`window`] does. When `end < total` the
-/// page is not the last one, and `next_start` is `Some(end)`.
+/// All bounds are defensively clamped so direct callers observe the same
+/// invariants as [`paginated`] and [`collect_window`]:
+/// * `start` is clamped to `total`.
+/// * `end` is clamped into `start..=total` so an inverted or oversized `end`
+///   never produces an over-long `limit` or a regressing `next_start`.
+/// * `count` is capped at the resulting window span `limit`.
+/// * When `end < total` the page is not the last one, and `next_start` is
+///   `Some(end)`.
 #[inline]
 pub fn page_info(total: u32, start: u32, end: u32, count: u32) -> PageInfo {
-    let has_more = end < total;
+    let clamped_start = start.min(total);
+    let clamped_end = end.min(total).max(clamped_start);
+    let limit = clamped_end.saturating_sub(clamped_start);
+    let has_more = clamped_end < total;
     PageInfo {
         total,
-        start,
-        limit: end.saturating_sub(start),
-        count,
+        start: clamped_start,
+        limit,
+        count: count.min(limit),
         has_more,
-        next_start: if has_more { Some(end) } else { None },
+        next_start: if has_more { Some(clamped_end) } else { None },
     }
 }
 
@@ -570,7 +593,7 @@ mod tests {
     #[test]
     fn collect_window_does_not_overflow_at_the_top_of_the_range() {
         let env = Env::default();
-        let (page, _) = collect_window(&env, u32::MAX, u32::MAX - 2, u32::MAX, |i| Some(i));
+        let (page, _) = collect_window(&env, u32::MAX, u32::MAX - 2, u32::MAX, Some);
         assert_eq!(plain(&page), StdVec::from([u32::MAX - 2, u32::MAX - 1]));
     }
 
@@ -590,5 +613,127 @@ mod tests {
         assert_eq!(info.count, 2);
         assert_eq!(page.get(0).unwrap(), all[1]);
         assert_eq!(page.get(1).unwrap(), all[2]);
+    }
+
+    // ── explicit boundary invariants ───────────────────────────────────────
+
+    #[test]
+    fn page_info_clamps_out_of_bounds_and_inverted_inputs() {
+        // Start and end beyond total clamp to total with no further pages.
+        let past_end = page_info(5, 10, 20, 4);
+        assert_eq!(past_end.total, 5);
+        assert_eq!(past_end.start, 5);
+        assert_eq!(past_end.limit, 0);
+        assert_eq!(past_end.count, 0);
+        assert!(!past_end.has_more);
+        assert_eq!(past_end.next_start, None);
+
+        // End exceeding total clamps to total and bounds count to the window span.
+        let oversized_end = page_info(5, 3, 50, 10);
+        assert_eq!(oversized_end.start, 3);
+        assert_eq!(oversized_end.limit, 2);
+        assert_eq!(oversized_end.count, 2);
+        assert!(!oversized_end.has_more);
+        assert_eq!(oversized_end.next_start, None);
+
+        // Inverted bounds (end < start) collapse to an empty window at start
+        // rather than emitting a regressing `next_start`.
+        let inverted = page_info(10, 8, 4, 3);
+        assert_eq!(inverted.start, 8);
+        assert_eq!(inverted.limit, 0);
+        assert_eq!(inverted.count, 0);
+        assert!(inverted.has_more);
+        assert_eq!(inverted.next_start, Some(8));
+    }
+
+    #[test]
+    fn page_window_covers_empty_zero_oversized_and_overflow_pages() {
+        // Empty collection always yields (0, 0).
+        for page in [0u32, 1, u32::MAX] {
+            for limit in [0u32, 1, MAX_LIMIT + 1, u32::MAX] {
+                assert_eq!(page_window(0, page, limit), (0, 0));
+            }
+        }
+
+        // Zero limit substitutes DEFAULT_LIMIT.
+        assert_eq!(page_window(120, 0, 0), (0, DEFAULT_LIMIT));
+        assert_eq!(
+            page_window(120, 1, 0),
+            (DEFAULT_LIMIT, DEFAULT_LIMIT * 2)
+        );
+        assert_eq!(page_window(120, 2, 0), (DEFAULT_LIMIT * 2, 120));
+        assert_eq!(page_window(120, 3, 0), (120, 120));
+
+        // Oversized limit clamps to MAX_LIMIT.
+        assert_eq!(page_window(250, 0, u32::MAX), (0, MAX_LIMIT));
+        assert_eq!(page_window(250, 1, MAX_LIMIT + 50), (MAX_LIMIT, MAX_LIMIT * 2));
+        assert_eq!(page_window(250, 2, u32::MAX), (MAX_LIMIT * 2, 250));
+
+        // Overflowing page index saturates without trapping.
+        assert_eq!(page_window(250, u32::MAX, 10), (250, 250));
+        assert_eq!(page_window(u32::MAX, u32::MAX, u32::MAX), (u32::MAX, u32::MAX));
+    }
+
+    #[test]
+    fn all_helpers_agree_on_empty_collection_boundaries() {
+        let env = Env::default();
+        let empty = nums(&env, 0);
+
+        for start in [0u32, 1, u32::MAX] {
+            for limit in [0u32, 1, DEFAULT_LIMIT, MAX_LIMIT, MAX_LIMIT + 1, u32::MAX] {
+                assert_eq!(window(0, start, limit), (0, 0));
+                assert!(paginate(&env, &empty, start, limit).is_empty());
+
+                let (slice, info) = paginated(&env, &empty, start, limit);
+                assert!(slice.is_empty());
+                assert_eq!(info.total, 0);
+                assert_eq!(info.start, 0);
+                assert_eq!(info.limit, 0);
+                assert_eq!(info.count, 0);
+                assert!(!info.has_more);
+                assert_eq!(info.next_start, None);
+
+                let mut calls = 0u32;
+                let (collected, c_info) = collect_window(&env, 0, start, limit, |i| {
+                    calls += 1;
+                    Some(i)
+                });
+                assert_eq!(calls, 0);
+                assert!(collected.is_empty());
+                assert_eq!(c_info, info);
+            }
+        }
+    }
+
+    #[test]
+    fn all_helpers_agree_on_offsets_at_and_past_the_end() {
+        let env = Env::default();
+        let total = 7u32;
+        let items = nums(&env, total);
+
+        for start in [total, total + 1, 100, u32::MAX] {
+            for limit in [0u32, 1, MAX_LIMIT + 1, u32::MAX] {
+                assert_eq!(window(total, start, limit), (total, total));
+                assert!(paginate(&env, &items, start, limit).is_empty());
+
+                let (slice, info) = paginated(&env, &items, start, limit);
+                assert!(slice.is_empty());
+                assert_eq!(info.total, total);
+                assert_eq!(info.start, total);
+                assert_eq!(info.limit, 0);
+                assert_eq!(info.count, 0);
+                assert!(!info.has_more);
+                assert_eq!(info.next_start, None);
+
+                let mut calls = 0u32;
+                let (collected, c_info) = collect_window(&env, total, start, limit, |i| {
+                    calls += 1;
+                    Some(i)
+                });
+                assert_eq!(calls, 0);
+                assert!(collected.is_empty());
+                assert_eq!(c_info, info);
+            }
+        }
     }
 }

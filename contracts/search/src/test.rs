@@ -450,3 +450,183 @@ fn top_k_selection_sorts_by_rating_desc_correctly() {
     assert_eq!(page.results.get(3).unwrap().rating, 20);
     assert_eq!(page.results.get(4).unwrap().rating, 10);
 }
+
+// ── Pagination boundary behavior ──────────────────────────────────────────
+
+#[test]
+fn pagination_boundaries_on_empty_collection_and_zero_matches() {
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+    let filters = empty_filters(&env);
+
+    // Empty index: every valid page and page size yields an empty result set.
+    for page_num in [0u32, 1, 10, u32::MAX] {
+        for page_size in [1u32, MAX_PAGE_SIZE] {
+            let page = client.search(&filters, &SortBy::PriceAsc, &page_num, &page_size);
+            assert!(page.results.is_empty());
+            assert_eq!(page.total_matches, 0);
+            assert_eq!(page.scanned, 0);
+            assert!(!page.truncated);
+
+            let (from, to) = shared::pagination::page_window(0, page_num, page_size);
+            assert_eq!((from, to), (0, 0));
+        }
+    }
+
+    // Non-empty index where filters match zero listings.
+    let artist = Address::generate(&env);
+    client.index_artist(
+        &artist,
+        &tags(&env, &["illustration"]),
+        &250_i128,
+        &Vec::new(&env),
+    );
+    let mut unmatched = empty_filters(&env);
+    unmatched.skill = Some(String::from_str(&env, "nonexistent-skill"));
+
+    let empty_items: Vec<ArtistListing> = Vec::new(&env);
+    for page_num in [0u32, 1, u32::MAX] {
+        let page = client.search(&unmatched, &SortBy::PriceAsc, &page_num, &10);
+        assert!(page.results.is_empty());
+        assert_eq!(page.total_matches, 0);
+        assert_eq!(page.scanned, 1);
+
+        let (shared_page, info) =
+            shared::pagination::paginated(&env, &empty_items, page_num, 10);
+        assert!(shared_page.is_empty());
+        assert_eq!(info.total, 0);
+        assert_eq!(info.start, 0);
+        assert_eq!(info.limit, 0);
+        assert_eq!(info.count, 0);
+        assert!(!info.has_more);
+        assert_eq!(info.next_start, None);
+    }
+}
+
+#[test]
+fn pagination_boundaries_for_zero_exact_and_oversized_limits() {
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+    let filters = empty_filters(&env);
+
+    for i in 0..3u32 {
+        let artist = Address::generate(&env);
+        client.index_artist(&artist, &Vec::new(&env), &(i as i128 * 100), &Vec::new(&env));
+    }
+
+    // Zero and oversized limits are rejected by `search` without incrementing analytics.
+    for invalid_limit in [0u32, MAX_PAGE_SIZE + 1, shared::pagination::MAX_LIMIT, u32::MAX] {
+        assert_eq!(
+            client.try_search(&filters, &SortBy::PriceAsc, &0, &invalid_limit),
+            Err(Ok(SearchError::InvalidPageSize))
+        );
+    }
+    assert_eq!(client.get_analytics().total_searches, 0);
+
+    // Exact valid bounds (1 and MAX_PAGE_SIZE) succeed.
+    let single = client.search(&filters, &SortBy::PriceAsc, &0, &1);
+    assert_eq!(single.results.len(), 1);
+    assert_eq!(single.total_matches, 3);
+
+    let max_valid = client.search(&filters, &SortBy::PriceAsc, &0, &MAX_PAGE_SIZE);
+    assert_eq!(max_valid.results.len(), 3);
+    assert_eq!(max_valid.total_matches, 3);
+    assert_eq!(client.get_analytics().total_searches, 2);
+
+    // Meanwhile, shared pagination helpers clamp zero to DEFAULT_LIMIT (= MAX_PAGE_SIZE)
+    // and oversized limits to MAX_LIMIT.
+    assert_eq!(shared::pagination::clamp_limit(0), MAX_PAGE_SIZE);
+    assert_eq!(
+        shared::pagination::clamp_limit(shared::pagination::MAX_LIMIT + 1),
+        shared::pagination::MAX_LIMIT
+    );
+    assert_eq!(
+        shared::pagination::clamp_limit(u32::MAX),
+        shared::pagination::MAX_LIMIT
+    );
+}
+
+#[test]
+fn pagination_boundaries_at_exact_end_past_end_and_u32_max_page() {
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+    let filters = empty_filters(&env);
+
+    for i in 0..6u32 {
+        let artist = Address::generate(&env);
+        client.index_artist(&artist, &Vec::new(&env), &((i + 1) as i128 * 10), &Vec::new(&env));
+    }
+
+    // Exact full pages covering 0..3 and 3..6.
+    let p0 = client.search(&filters, &SortBy::PriceAsc, &0, &3);
+    assert_eq!(p0.results.len(), 3);
+    assert_eq!(p0.results.get(0).unwrap().price, 10);
+    assert_eq!(p0.results.get(2).unwrap().price, 30);
+
+    let p1 = client.search(&filters, &SortBy::PriceAsc, &1, &3);
+    assert_eq!(p1.results.len(), 3);
+    assert_eq!(p1.results.get(0).unwrap().price, 40);
+    assert_eq!(p1.results.get(2).unwrap().price, 60);
+
+    // Exact end (start == total_matches), past end, and overflow-boundary page.
+    for out_of_range_page in [2u32, 3, 100, u32::MAX] {
+        let page = client.search(&filters, &SortBy::PriceAsc, &out_of_range_page, &3);
+        assert!(page.results.is_empty());
+        assert_eq!(page.total_matches, 6);
+        assert_eq!(page.page, out_of_range_page);
+        assert_eq!(page.page_size, 3);
+
+        let (from, to) = shared::pagination::page_window(6, out_of_range_page, 3);
+        assert_eq!((from, to), (6, 6));
+    }
+}
+
+#[test]
+fn contract_search_pages_match_shared_pagination_boundaries() {
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+    let filters = empty_filters(&env);
+
+    // Index more than one full MAX_PAGE_SIZE (50) page to exercise full, short
+    // final, exact-end, and past-end windows end to end.
+    let total = MAX_PAGE_SIZE + 15;
+    let mut expected_prices: Vec<i128> = Vec::new(&env);
+    for i in 0..total {
+        let price = (i as i128) * 5;
+        let artist = Address::generate(&env);
+        client.index_artist(&artist, &Vec::new(&env), &price, &Vec::new(&env));
+        expected_prices.push_back(price);
+    }
+
+    for page_num in [0u32, 1, 2, 10, u32::MAX] {
+        let page = client.search(&filters, &SortBy::PriceAsc, &page_num, &MAX_PAGE_SIZE);
+        let (from, to) = shared::pagination::page_window(total, page_num, MAX_PAGE_SIZE);
+        let (expected_slice, info) = shared::pagination::paginated(
+            &env,
+            &expected_prices,
+            page_num.saturating_mul(MAX_PAGE_SIZE),
+            MAX_PAGE_SIZE,
+        );
+
+        assert_eq!(page.total_matches, total);
+        assert_eq!(page.results.len(), to - from);
+        assert_eq!(page.results.len(), expected_slice.len());
+        assert_eq!(info.count, page.results.len());
+        assert_eq!(info.has_more, page_num == 0);
+        assert_eq!(
+            info.next_start,
+            if page_num == 0 {
+                Some(MAX_PAGE_SIZE)
+            } else {
+                None
+            }
+        );
+
+        for idx in 0..expected_slice.len() {
+            assert_eq!(
+                page.results.get(idx).unwrap().price,
+                expected_slice.get(idx).unwrap()
+            );
+        }
+    }
+}
