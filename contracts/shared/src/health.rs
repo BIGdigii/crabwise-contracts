@@ -12,6 +12,15 @@
 //! Off-chain monitors invoke `health_check` on a schedule (see `docs/SLA.md`).
 //! Operators (or the contract itself) call `record_ok` / `record_error` so the
 //! counters reflect real invocation outcomes.
+//!
+//! ## Dependency health
+//!
+//! A failing downstream dependency is reported through `record_error`. Once the
+//! dependency recovers, `record_ok` moves `last_ok_ledger` forward and the next
+//! `health_check` returns `Healthy` again once the error rate falls below the
+//! degraded threshold. `HealthReport::dependency_healthy` exposes a direct
+//! boolean signal: `false` whenever the status is not `Healthy` or the contract
+//! is paused, so operators can key alerts off a single field.
 
 use crate::pause::PauseDataKey;
 use soroban_sdk::{contracttype, symbol_short, Env};
@@ -89,6 +98,10 @@ pub struct SlaTargets {
 }
 
 /// Result of [`health_check`]: status, raw metrics, derived error rate, anomaly flag.
+///
+/// `dependency_healthy` is `true` only when the status is `Healthy` and the
+/// contract is not paused. It is the single operational signal for dependency
+/// failure: `false` means a dependency is failing or the contract is held.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HealthReport {
@@ -97,6 +110,7 @@ pub struct HealthReport {
     pub error_bps: u32,
     pub anomaly: bool,
     pub stalled: bool,
+    pub dependency_healthy: bool,
 }
 
 pub fn default_alert_config() -> AlertConfig {
@@ -259,11 +273,13 @@ pub fn health_check(env: &Env) -> HealthReport {
     let metrics = get_metrics(env);
     let config = get_alert_config(env);
     let (status, anomaly) = classify(env, &metrics, &config);
+    let dependency_healthy = status == HealthStatus::Healthy && !metrics.paused;
     let report = HealthReport {
         status,
         error_bps: error_bps(&metrics),
         stalled: is_stalled(env, &metrics, &config),
         anomaly,
+        dependency_healthy,
         metrics,
     };
     maybe_emit_alert(env, &report, &config);

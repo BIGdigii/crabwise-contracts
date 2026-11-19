@@ -29,6 +29,17 @@ cargo run --bin worker
 | `/ready` | GET | 200 OK when ready to serve traffic |
 | `/metrics` | GET | Prometheus text exposition: process counters, per-route request/error counts, and request-latency histogram |
 
+### Dependency health status
+
+The `/health` report includes a dependency-health status field that signals whether the worker's upstream dependencies (Horizon and the Soroban RPC) are reachable:
+
+| Status | Meaning | Operator response |
+|--------|---------|-------------------|
+| `healthy` | All dependencies responded on the last check | No action needed |
+| `unhealthy` | At least one dependency failed its last check | Check Horizon/RPC reachability (see Troubleshooting); donation verification may be delayed |
+
+The status returns to `healthy` automatically once a dependency check succeeds again; no restart is required. Alert on `unhealthy` persisting for more than one check interval, and confirm recovery by watching for the status to flip back to `healthy` on `/health`.
+
 Every Soroban contract also exposes on-chain `health_check`, `get_sla_targets`,
 and `detect_anomaly`. See [SLA.md](./SLA.md) and [DEPLOY.md](./DEPLOY.md).
 
@@ -84,6 +95,7 @@ Key metrics to monitor:
 1. Verify Horizon endpoint is reachable
 2. Check the transaction hash exists on the ledger
 3. Donation status may stay at `Submitted` if Horizon is behind
+4. Check the dependency-health status on `/health`; `unhealthy` confirms an upstream failure, and it should return to `healthy` once the dependency recovers
 
 ### Worker won't start
 
